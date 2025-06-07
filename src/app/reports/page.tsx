@@ -24,53 +24,124 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
-import { Download, Loader2 } from "lucide-react";
+import { Download, Loader2, Upload } from "lucide-react";
 import { collection, getDocs, query, where, orderBy } from "firebase/firestore";
 import { db } from "../../../firebase";
 import * as XLSX from "xlsx";
+import { Input } from "@/components/ui/input";
+import { Timestamp } from "firebase/firestore";
 
 interface AttendanceRecord {
-  id: string;
   rollNumber: string;
   count: number;
-  fine: number;
   createdAt: string;
-  archivedAt: any;
   dept: string;
-  status: boolean;
+  paidAt?: string;
+  paidFine: number;
+  uf: number;
+  timestamps: {
+    L1?: string;
+    L2?: string;
+    L3?: string;
+    L4?: string;
+    L5?: string;
+    L6?: string;
+    L7?: string;
+    L8?: string;
+  };
+}
+
+interface ExcelRecord {
+  RollNo: string;
+  Name: string;
+  Dept: string;
+  Semister: string;
+}
+
+interface ExcelRow {
+  [key: string]: string | number | null;
+}
+
+interface ExcelData {
+  [key: number]: string | number | null;
+  length: number;
+}
+
+interface ColumnMap {
+  rollNo: string;
+  name: string;
+  semester: string;
+}
+
+// Add a helper function to format timestamps
+function formatTimestamp(timestamp: any): string {
+  if (!timestamp) return "-";
+  if (timestamp instanceof Timestamp) {
+    return timestamp.toDate().toLocaleString();
+  }
+  return "-";
 }
 
 export default function ReportsPage() {
   const [selectedMonth, setSelectedMonth] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [matchedRecords, setMatchedRecords] = useState<
+    (AttendanceRecord & ExcelRecord)[]
+  >([]);
+
+  // Replace this with your Google Spreadsheet link
+  const SPREADSHEET_URL =
+    "https://docs.google.com/spreadsheets/d/1ALQWqADE8E3DBwIL3U-RaYg8vY-t-Yn1/edit?usp=sharing&ouid=117677212679251065100&rtpof=true&sd=true";
 
   const fetchRecords = async (month: string, year: string) => {
     setIsLoading(true);
     try {
       const formattedMonth = `${parseInt(month, 10)} ${year}`;
-      const attendanceRef = collection(db, "archive");
+      const archiveRef = collection(db, "archive");
 
-      // Create a query to filter documents
-      const q = query(
-        attendanceRef,
-        where("createdAt", "==", formattedMonth),
-        orderBy("rollNumber", "asc")
-      );
+      // Get all documents from archive collection
+      const snapshot = await getDocs(archiveRef);
+      const allData: AttendanceRecord[] = [];
 
-      const querySnapshot = await getDocs(q);
-      const data = querySnapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      })) as AttendanceRecord[];
+      // Process each department's document
+      for (const doc of snapshot.docs) {
+        const deptData = doc.data();
 
-      setRecords(data);
+        // Convert document data to records and filter by createdAt
+        Object.entries(deptData).forEach(
+          ([rollNumber, record]: [string, any]) => {
+            if (record.createdAt === formattedMonth) {
+              allData.push({
+                rollNumber,
+                count: record.count,
+                createdAt: record.createdAt,
+                dept: record.dept,
+                paidAt: record.paidAt,
+                paidFine: record.pf || 0,
+                uf: record.uf || 0,
+                timestamps: record.timestamps || {},
+              });
+            }
+          }
+        );
+      }
 
-      if (data.length === 0) {
+      // Sort by department and roll number
+      const sortedData = allData.sort((a, b) => {
+        if (a.dept !== b.dept) {
+          return a.dept.localeCompare(b.dept);
+        }
+        return a.rollNumber.localeCompare(b.rollNumber);
+      });
+
+      setRecords(sortedData);
+
+      if (sortedData.length === 0) {
         alert(`No records found for ${formattedMonth}.`);
       }
 
-      return data;
+      return sortedData;
     } catch (error) {
       console.error("Error retrieving data:", error);
       alert("Failed to retrieve data. Please try again later.");
@@ -86,48 +157,235 @@ export default function ReportsPage() {
     await fetchRecords(month, year);
   };
 
-  const handleDownload = async () => {
-    if (!selectedMonth) return;
+  const processExcelFile = async () => {
+    if (!records.length) return;
 
     setIsLoading(true);
     try {
-      const [month, year] = selectedMonth.split("-");
-      const data = await fetchRecords(month, year);
+      // Convert Google Spreadsheet URL to export URL
+      const spreadsheetId = SPREADSHEET_URL.match(/\/d\/(.*?)(\/|$)/)?.[1];
+      if (!spreadsheetId) {
+        throw new Error("Invalid Google Spreadsheet link format");
+      }
 
-      if (data.length === 0) return;
+      // Create export URL for Excel format
+      const exportUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=xlsx`;
 
-      // Prepare data for Excel export
-      const exportData = data.map((record) => ({
-        "Roll Number": record.rollNumber,
-        Department: record.dept,
-        "Late Count": record.count,
-        "Fine Amount": `₹${record.fine * 50}`,
-        "Payment Status": record.status ? "Paid" : "Unpaid",
-        "Created Date": record.createdAt,
-        "Archived Date": record.archivedAt?.toDate().toLocaleString() || "N/A",
+      console.log("Fetching spreadsheet from:", exportUrl);
+      const response = await fetch(exportUrl);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      console.log(
+        "File fetched successfully, size:",
+        arrayBuffer.byteLength,
+        "bytes"
+      );
+
+      // Read the Excel file
+      const sourceWorkbook = XLSX.read(new Uint8Array(arrayBuffer), {
+        type: "array",
+      });
+      console.log("Available sheets:", sourceWorkbook.SheetNames);
+
+      // Use the first sheet
+      const sourceWorksheet =
+        sourceWorkbook.Sheets[sourceWorkbook.SheetNames[0]];
+      console.log("Worksheet range:", sourceWorksheet["!ref"]);
+
+      // Convert to JSON with headers
+      const excelData = XLSX.utils.sheet_to_json(sourceWorksheet, {
+        raw: false,
+        defval: "",
+        blankrows: false,
+        header: 1,
+      }) as Array<Array<string | number | null>>;
+
+      console.log("Raw Excel Data:", JSON.stringify(excelData, null, 2));
+
+      if (!Array.isArray(excelData) || excelData.length < 3) {
+        throw new Error("Spreadsheet is empty or has no data rows");
+      }
+
+      // Skip the first row (A, B, C) and get headers from second row
+      const headers = excelData[0].map((h) => String(h));
+      console.log("Headers found:", headers);
+
+      // Find column indices
+      const rollNoIndex = headers.findIndex(
+        (header) => header.toLowerCase().trim() === "rollno"
+      );
+      const nameIndex = headers.findIndex(
+        (header) => header.toLowerCase().trim() === "name"
+      );
+      const deptIndex = headers.findIndex(
+        (header) => header.toLowerCase().trim() === "dept"
+      );
+      const semesterIndex = headers.findIndex(
+        (header) => header.toLowerCase().trim() === "semister"
+      );
+
+      console.log("Column indices:", {
+        rollNoIndex,
+        nameIndex,
+        deptIndex,
+        semesterIndex,
+      });
+
+      if (
+        rollNoIndex === -1 ||
+        nameIndex === -1 ||
+        deptIndex === -1 ||
+        semesterIndex === -1
+      ) {
+        throw new Error(
+          `Could not find required columns. Headers must be exactly "RollNo", "Name", "Dept" and "Semister". Found: ${headers.join(
+            ", "
+          )}`
+        );
+      }
+
+      // Convert the data to our format, skipping the first row (headers)
+      const normalizedData = excelData
+        .slice(1)
+        .map((row: Array<string | number | null>) => {
+          if (!Array.isArray(row)) {
+            console.warn(`Invalid row format:`, row);
+            return null;
+          }
+
+          const rollNo = row[rollNoIndex];
+          const name = row[nameIndex];
+          const dept = row[deptIndex];
+          const semister = row[semesterIndex];
+
+          console.log(`Processing row:`, { rollNo, name, dept, semister });
+
+          if (!rollNo || !name || !dept || !semister) {
+            console.warn(`Row has missing data:`, {
+              rollNo,
+              name,
+              dept,
+              semister,
+            });
+            return null;
+          }
+
+          const normalizedRow: ExcelRecord = {
+            RollNo: String(rollNo).trim(),
+            Name: String(name).trim(),
+            Dept: String(dept).trim(),
+            Semister: String(semister).trim(),
+          };
+
+          console.log(`Normalized row:`, normalizedRow);
+          return normalizedRow;
+        })
+        .filter(
+          (row): row is ExcelRecord =>
+            row !== null && typeof row.RollNo === "string" && row.RollNo !== ""
+        );
+
+      console.log("Normalized data:", normalizedData);
+
+      if (normalizedData.length === 0) {
+        throw new Error("No valid data rows found in Spreadsheet");
+      }
+
+      // Match records with better error handling
+      const matched = records.map((record) => {
+        const excelRecord = normalizedData.find(
+          (excel) =>
+            String(excel.RollNo).toLowerCase().trim() ===
+            String(record.rollNumber).toLowerCase().trim()
+        );
+
+        if (excelRecord) {
+          return {
+            ...record,
+            dept: excelRecord.Dept, // Use department from Excel
+            RollNo: excelRecord.RollNo,
+            Name: excelRecord.Name,
+            Dept: excelRecord.Dept,
+            Semister: excelRecord.Semister,
+          } as AttendanceRecord & ExcelRecord;
+        }
+
+        // If no match found, create a compatible record
+        return {
+          ...record,
+          RollNo: record.rollNumber,
+          Name: "N/A",
+          Dept: record.dept,
+          Semister: "N/A",
+        } as AttendanceRecord & ExcelRecord;
+      });
+
+      console.log("Total matches found:", matched.length);
+      setMatchedRecords(matched);
+
+      if (matched.length === 0) {
+        alert(`No matching records found. Please check if:
+1. The Spreadsheet has these exact column names: "RollNo", "Name", "Dept", "Semister"
+2. Roll numbers in Spreadsheet match the database format exactly
+3. Data is present in all columns
+
+Found headers: ${headers.join(", ")}`);
+      } else {
+        alert(`Successfully matched ${matched.length} records!`);
+      }
+    } catch (error) {
+      console.error("Error processing Excel file:", error);
+      alert("Failed to process Excel file. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!selectedMonth || !matchedRecords.length) return;
+
+    try {
+      const dataToExport = matchedRecords.map((record) => ({
+        RollNo: record.rollNumber,
+        Name: record.Name,
+        Dept: record.Dept, // Using Excel sheet department
+        Semister: record.Semister,
+        L1: formatTimestamp(record.timestamps?.L1),
+        L2: formatTimestamp(record.timestamps?.L2),
+        L3: formatTimestamp(record.timestamps?.L3),
+        L4: formatTimestamp(record.timestamps?.L4),
+        L5: formatTimestamp(record.timestamps?.L5),
+        L6: formatTimestamp(record.timestamps?.L6),
+        L7: formatTimestamp(record.timestamps?.L7),
+        L8: formatTimestamp(record.timestamps?.L8),
+        "Paid Fine": `₹${record.paidFine}`,
+        "Unpaid Fine": `₹${record.uf || 0}`,
+        "Paid at": formatTimestamp(record.paidAt),
       }));
 
-      // Convert to Excel format
-      const worksheet = XLSX.utils.json_to_sheet(exportData);
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, "Attendance");
+      const exportWorksheet = XLSX.utils.json_to_sheet(dataToExport);
+      const exportWorkbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(
+        exportWorkbook,
+        exportWorksheet,
+        "Attendance"
+      );
 
-      // Auto-size columns
-      const maxWidth = exportData.reduce(
+      const maxWidth = dataToExport.reduce(
         (w, r) => Math.max(w, Object.keys(r).length),
         0
       );
-      const colWidths = new Array(maxWidth).fill({ wch: 15 });
-      worksheet["!cols"] = colWidths;
+      exportWorksheet["!cols"] = new Array(maxWidth).fill({ wch: 15 });
 
-      // Export file
-      XLSX.writeFile(workbook, `Attendance_${selectedMonth}.xlsx`);
+      XLSX.writeFile(exportWorkbook, `Attendance_${selectedMonth}.xlsx`);
       alert(`Excel file has been downloaded for ${selectedMonth}.`);
     } catch (error) {
       console.error("Error exporting data:", error);
       alert("Failed to export data. Please try again later.");
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -135,107 +393,162 @@ export default function ReportsPage() {
 
   return (
     <div className="container mx-auto p-4">
-      <h1 className="text-2xl font-bold mb-4">Attendance Reports</h1>
-
-      <Card className="mb-8">
+      <Card>
         <CardHeader>
-          <CardTitle>Monthly Attendance Report</CardTitle>
+          <CardTitle>Late Comers Report</CardTitle>
           <CardDescription>
-            View and download attendance records by month
+            View and download late comers reports by month. The system will
+            match records with the master Spreadsheet.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <label htmlFor="month-select" className="text-sm font-medium">
-              Select Month
-            </label>
-            <Select value={selectedMonth} onValueChange={handleMonthChange}>
-              <SelectTrigger id="month-select">
-                <SelectValue placeholder="Select a month" />
-              </SelectTrigger>
-              <SelectContent>
-                {Array.from({ length: 12 }, (_, index) => {
-                  const month = String(index + 1).padStart(2, "0");
-                  return (
-                    <SelectItem key={month} value={`${month}-${currentYear}`}>
-                      {new Date(0, index).toLocaleString("default", {
-                        month: "long",
-                      })}{" "}
-                      {currentYear}
-                    </SelectItem>
-                  );
-                })}
-              </SelectContent>
-            </Select>
-          </div>
+        <CardContent>
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col sm:flex-row gap-4">
+              <Select onValueChange={handleMonthChange} value={selectedMonth}>
+                <SelectTrigger className="w-full sm:w-[180px]">
+                  <SelectValue placeholder="Select month" />
+                </SelectTrigger>
+                <SelectContent>
+                  {Array.from({ length: 12 }, (_, i) => {
+                    const month = i + 1;
+                    const year = new Date().getFullYear();
+                    const value = `${month}-${year}`;
+                    return (
+                      <SelectItem key={value} value={value}>
+                        {new Date(year, i).toLocaleString("default", {
+                          month: "long",
+                          year: "numeric",
+                        })}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
 
-          <Button
-            onClick={handleDownload}
-            disabled={!selectedMonth || isLoading}
-            className="w-full"
-          >
-            {isLoading ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Generating
-                Report...
-              </>
-            ) : (
-              <>
-                <Download className="mr-2 h-4 w-4" /> Download Excel Report
-              </>
+              <div className="flex flex-row gap-2 w-full sm:w-auto">
+                <Button
+                  variant="outline"
+                  onClick={processExcelFile}
+                  disabled={isLoading || !records.length}
+                  className="flex-1 sm:flex-none whitespace-nowrap"
+                >
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Processing
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="mr-2 h-4 w-4" />
+                      Process Sheet
+                    </>
+                  )}
+                </Button>
+
+                <Button
+                  variant="outline"
+                  onClick={handleDownload}
+                  disabled={!matchedRecords.length}
+                  className="flex-1 sm:flex-none whitespace-nowrap"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  Download
+                </Button>
+              </div>
+            </div>
+
+            {(matchedRecords.length > 0 || records.length > 0) && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Records Preview</CardTitle>
+                  <CardDescription>
+                    Showing {matchedRecords.length || records.length} records
+                    for {selectedMonth}
+                    {matchedRecords.length > 0 &&
+                      " (Matched with Spreadsheet data)"}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>RollNo</TableHead>
+                          <TableHead>Name</TableHead>
+                          <TableHead>Dept</TableHead>
+                          <TableHead>Semister</TableHead>
+                          <TableHead>L1</TableHead>
+                          <TableHead>L2</TableHead>
+                          <TableHead>L3</TableHead>
+                          <TableHead>L4</TableHead>
+                          <TableHead>L5</TableHead>
+                          <TableHead>L6</TableHead>
+                          <TableHead>L7</TableHead>
+                          <TableHead>L8</TableHead>
+                          <TableHead>Paid Fine</TableHead>
+                          <TableHead>Unpaid Fine</TableHead>
+                          <TableHead>Paid at</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {(matchedRecords.length > 0
+                          ? matchedRecords
+                          : records
+                        ).map((record) => (
+                          <TableRow key={record.rollNumber}>
+                            <TableCell>{record.rollNumber}</TableCell>
+                            <TableCell>
+                              {(record as AttendanceRecord & ExcelRecord)
+                                .Name || "N/A"}
+                            </TableCell>
+                            <TableCell>
+                              {(record as AttendanceRecord & ExcelRecord)
+                                .Dept || record.dept}
+                            </TableCell>
+                            <TableCell>
+                              {(record as AttendanceRecord & ExcelRecord)
+                                .Semister || "N/A"}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L1)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L2)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L3)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L4)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L5)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L6)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L7)}
+                            </TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.timestamps?.L8)}
+                            </TableCell>
+                            <TableCell>₹{record.paidFine}</TableCell>
+                            <TableCell>₹{record.uf || 0}</TableCell>
+                            <TableCell>
+                              {formatTimestamp(record.paidAt)}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
             )}
-          </Button>
+          </div>
         </CardContent>
       </Card>
-
-      {records.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Records Preview</CardTitle>
-            <CardDescription>
-              Showing {records.length} records for {selectedMonth}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Roll Number</TableHead>
-                    <TableHead>Department</TableHead>
-                    <TableHead>Late Count</TableHead>
-                    <TableHead>Fine Amount</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Created Date</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {records.map((record) => (
-                    <TableRow key={record.id}>
-                      <TableCell>{record.rollNumber}</TableCell>
-                      <TableCell>{record.dept}</TableCell>
-                      <TableCell>{record.count}</TableCell>
-                      <TableCell>₹{record.fine * 50}</TableCell>
-                      <TableCell>
-                        <span
-                          className={`px-2 py-1 rounded-full text-xs ${
-                            record.status
-                              ? "bg-green-100 text-green-800"
-                              : "bg-red-100 text-red-800"
-                          }`}
-                        >
-                          {record.status ? "Paid" : "Unpaid"}
-                        </span>
-                      </TableCell>
-                      <TableCell>{record.createdAt}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          </CardContent>
-        </Card>
-      )}
     </div>
   );
 }

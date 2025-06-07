@@ -5,7 +5,13 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "../../context/AuthContext";
-import { doc, increment, setDoc, serverTimestamp } from "firebase/firestore";
+import {
+  doc,
+  increment,
+  setDoc,
+  serverTimestamp,
+  getDoc,
+} from "firebase/firestore";
 import { db } from "../../firebase";
 import { Loader2 } from "lucide-react";
 
@@ -21,11 +27,30 @@ export default function BarcodeScanner() {
   const year = date.getFullYear();
   const createdAt = `${month + 1} ${year}`;
 
-  // Auto-focus input on mount and after submission
+  // Focus input on mount and after any state changes
   useEffect(() => {
-    if (inputRef.current) {
-      inputRef.current.focus();
-    }
+    const focusInput = () => {
+      if (inputRef.current) {
+        inputRef.current.focus();
+      }
+    };
+
+    // Initial focus
+    focusInput();
+
+    // Set up an interval to check and refocus if needed
+    const focusInterval = setInterval(focusInput, 1000);
+
+    // Add click event listener to refocus when clicking anywhere on the page
+    const handleClick = () => {
+      focusInput();
+    };
+    document.addEventListener("click", handleClick);
+
+    return () => {
+      clearInterval(focusInterval);
+      document.removeEventListener("click", handleClick);
+    };
   }, []);
 
   const validateRollNumber = (roll: string): boolean => {
@@ -51,6 +76,11 @@ export default function BarcodeScanner() {
     return true;
   };
 
+  const calculateUnpaidFine = (count: number): number => {
+    if (count <= 3) return 0;
+    return (count - 3) * 50; // 50 rupees for each time after 3rd late mark
+  };
+
   const handleSubmit = async () => {
     if (!currentUser) {
       toast({
@@ -68,44 +98,77 @@ export default function BarcodeScanner() {
     try {
       setIsSubmitting(true);
       const roll = +rollNumber;
-      const docRef = doc(db, "users", currentUser.uid);
-      const rollObj = { ...userDataobj };
+      const timestamp = serverTimestamp();
 
-      // Prepare base data
-      const baseData = {
-        count: userDataobj.hasOwnProperty(roll) ? increment(1) : 1,
-        status: false,
-        createdAt: createdAt,
-        lastUpdated: serverTimestamp(),
+      // Get user's department from their document
+      const userDocRef = doc(db, "users", currentUser.uid);
+      const userDoc = await getDoc(userDocRef);
+      const userDept = userDoc.data()?.dept || "unknown";
+
+      // Get or create late-comer document
+      const lateComersDocRef = doc(db, "late-comers", userDept);
+      const lateComersDoc = await getDoc(lateComersDocRef);
+      const existingData = lateComersDoc.data() || {};
+      const existingRollData = existingData[roll] || {};
+
+      // Calculate new count and prepare timestamp field
+      const newCount = (existingRollData.count || 0) + 1;
+      const timestampField = `L${newCount}`;
+
+      // Calculate unpaid fine
+      const unpaidFine = calculateUnpaidFine(newCount);
+
+      // Prepare data to save
+      const lateComersData = {
+        [roll]: {
+          ...existingRollData,
+          dept: userDept,
+          count: newCount,
+          uf: unpaidFine,
+          pf: existingRollData.pf || 0,
+          timestamps: {
+            ...(existingRollData.timestamps || {}),
+            [timestampField]: timestamp,
+          },
+          createdAt: existingRollData.createdAt || createdAt,
+        },
       };
 
-      // Update or create record
-      await setDoc(
-        docRef,
-        {
-          [roll]: baseData,
-        },
-        { merge: true }
-      );
+      // Save to late-comers collection
+      await setDoc(lateComersDocRef, lateComersData, { merge: true });
 
-      // Update local count for toast message
-      const newCount = rollObj[roll] ? rollObj[roll].count + 1 : 1;
+      // Prepare and save to archive collection
+      const archiveMonth = `${userDept}_${month + 1}_${year}`;
+      const archiveDocRef = doc(db, "archive", archiveMonth);
+      const archiveDoc = await getDoc(archiveDocRef);
+      const existingArchiveData = archiveDoc.data() || {};
+      const archiveRecord = existingArchiveData[roll] || {};
 
-      // Check if fine needs to be applied
-      if (newCount > 3) {
-        await setDoc(
-          docRef,
-          {
-            [roll]: {
-              fine: increment(1),
-            },
+      const archiveData = {
+        [roll]: {
+          ...archiveRecord,
+          rollNumber: roll.toString(),
+          dept: userDept,
+          count: newCount,
+          uf: unpaidFine,
+          pf: existingRollData.pf || 0,
+          timestamps: {
+            ...(archiveRecord.timestamps || {}),
+            [timestampField]: timestamp,
           },
-          { merge: true }
-        );
+          createdAt: existingRollData.createdAt || createdAt,
+          lastUpdated: timestamp,
+        },
+      };
 
+      // Save to archive collection
+      await setDoc(archiveDocRef, archiveData, { merge: true });
+
+      // Show appropriate toast message
+      if (newCount > 3) {
         toast({
           title: "⚠️ Collect ID! Late comer",
-          description: `Roll number ${roll} has been late ${newCount} times. Fine will be applied.`,
+          description: `Roll number ${roll} has been late ${newCount} times. Fine amount: ₹${unpaidFine}`,
           variant: "destructive",
         });
       } else {

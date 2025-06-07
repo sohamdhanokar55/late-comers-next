@@ -12,17 +12,26 @@ import {
 import { Button } from "@/components/ui/button";
 import { useAuth } from "../../context/AuthContext";
 import Loading from "./Loading";
-import { doc, updateDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import {
+  doc,
+  updateDoc,
+  setDoc,
+  serverTimestamp,
+  getDoc,
+} from "firebase/firestore";
 import { db } from "../../firebase";
 import { Search, AlertTriangle } from "lucide-react";
 import { Input } from "./ui/input";
 import Login from "./Login";
+import { useToast } from "@/hooks/use-toast";
 
 type LateComerData = {
+  dept: string;
   count: number;
-  status: boolean;
-  fine: number;
-  createdAt: string | null;
+  uf: number;
+  pf: number;
+  lastUpdated: any;
+  [key: string]: any; // For L1, L2, etc. timestamps
 };
 
 export default function LateComersTable() {
@@ -32,33 +41,49 @@ export default function LateComersTable() {
     {}
   );
   const [dept, setDept] = useState<string>("");
+  const { toast } = useToast();
 
   useEffect(() => {
     if (currentUser && userDataobj) {
-      // Filter out entries where count <= 3 and remove 'dept' field
-      const filteredLateComers = Object.entries(
-        userDataobj as Record<string, LateComerData>
-      )
-        .filter(
-          ([key, value]) =>
-            key !== "dept" &&
-            value &&
-            typeof value === "object" &&
-            "count" in value &&
-            value.count > 3
-        )
-        .reduce(
-          (acc, [key, value]) => ({
-            ...acc,
-            [key]: value,
-          }),
-          {} as Record<string, LateComerData>
-        );
+      // Get department from user data
+      const userDept = userDataobj.dept || "";
+      setDept(userDept);
 
-      setLateComers(filteredLateComers);
-      setDept(userDataobj.dept || "");
+      // Get late-comers data for this department
+      const fetchLateComers = async () => {
+        try {
+          // Check if department exists
+          if (!userDept) {
+            console.error("No department found for user");
+            toast({
+              title: "Error",
+              description: "No department found. Please contact administrator.",
+              variant: "destructive",
+            });
+            return;
+          }
+
+          const lateComersDocRef = doc(db, "late-comers", userDept);
+          const lateComersDoc = await getDoc(lateComersDocRef);
+          const lateComersData = lateComersDoc.data() || {};
+
+          // Set all late comers data for this department
+          setLateComers(lateComersData);
+        } catch (error) {
+          console.error("Error fetching late-comers:", error);
+          toast({
+            title: "Error",
+            description: "Failed to fetch late-comers data. Please try again.",
+            variant: "destructive",
+          });
+        }
+      };
+
+      if (userDept) {
+        fetchLateComers();
+      }
     }
-  }, [currentUser, userDataobj]);
+  }, [currentUser, userDataobj, toast]);
 
   if (loading) {
     return <Loading />;
@@ -70,41 +95,66 @@ export default function LateComersTable() {
 
   const handlePaymentUpdate = async (rollNumber: string) => {
     try {
-      const docRef = doc(db, "users", currentUser.uid);
-      const archiveRef = doc(db, "archive", `${currentUser.uid}_${rollNumber}`);
+      // Check if department exists
+      if (!dept) {
+        toast({
+          title: "Error",
+          description: "No department found. Please contact administrator.",
+          variant: "destructive",
+        });
+        return;
+      }
 
+      const lateComersDocRef = doc(db, "late-comers", dept);
       const isConfirm = window.confirm(
         `Are you sure you want to mark Roll No. ${rollNumber} as paid?`
       );
 
       if (isConfirm) {
         const currentRecord = lateComers[rollNumber];
-        const fineAmount = currentRecord.fine * 50; // ₹50 per fine
+        const fineAmount = currentRecord.uf; // Unpaid fine amount
 
-        const dataToArchive = {
-          rollNumber,
-          dept,
-          count: currentRecord.count,
-          fine: currentRecord.fine,
-          totalAmount: fineAmount,
-          status: true,
-          createdAt: currentRecord.createdAt,
-          archivedAt: serverTimestamp(),
-        };
+        // Get current month and year for archive document
+        const date = new Date();
+        const month = date.getMonth();
+        const year = date.getFullYear();
+        const archiveMonth = `${dept}_${month + 1}_${year}`;
+        const archiveDocRef = doc(db, "archive", archiveMonth);
 
-        // Save to archive
-        await setDoc(archiveRef, dataToArchive);
+        // Get existing archive data
+        const archiveDoc = await getDoc(archiveDocRef);
+        const existingArchiveData = archiveDoc.data() || {};
+        const archiveRecord = existingArchiveData[rollNumber] || {};
 
-        // Update user record
-        await updateDoc(docRef, {
+        // Update late-comers record
+        await updateDoc(lateComersDocRef, {
           [rollNumber]: {
-            status: true,
-            count: 0,
-            fine: 0,
+            ...currentRecord,
+            pf: (currentRecord.pf || 0) + fineAmount,
+            uf: 0,
+            lastUpdated: serverTimestamp(),
+          },
+        });
+        console.log(archiveRecord);
+        console.log(currentRecord);
+
+        // Update archive record
+        await updateDoc(archiveDocRef, {
+          [rollNumber]: {
+            ...archiveRecord,
+            rollNumber: rollNumber,
+            dept: currentRecord.dept,
+            count: currentRecord.count,
+            pf: (archiveRecord.pf || 0) + fineAmount,
+            uf: 0,
+            timestamps: currentRecord.timestamps || {},
+            createdAt: currentRecord.createdAt,
+            lastUpdated: serverTimestamp(),
+            paidAt: serverTimestamp(),
           },
         });
 
-        // Update local state by removing the paid record
+        // Update local state
         const updatedLateComers = { ...lateComers };
         delete updatedLateComers[rollNumber];
         setLateComers(updatedLateComers);
@@ -122,11 +172,22 @@ export default function LateComersTable() {
 
   // Filter and Sort LateComers
   const filteredAndSortedLateComers = Object.keys(lateComers)
-    .filter((rollNumber) =>
-      rollNumber.toLowerCase().includes(searchQuery.trim().toLowerCase())
-    )
+    .filter((rollNumber) => {
+      const student = lateComers[rollNumber];
+      // Only show students with unpaid fines and matching search query
+      return (
+        student.uf > 0 &&
+        rollNumber.toLowerCase().includes(searchQuery.trim().toLowerCase())
+      );
+    })
     .sort((a, b) => {
-      // Sort by count in descending order
+      // Sort by unpaid fine amount in descending order
+      const fineA = lateComers[a].uf;
+      const fineB = lateComers[b].uf;
+      if (fineA !== fineB) {
+        return fineB - fineA;
+      }
+      // If fines are equal, sort by count in descending order
       const countA = lateComers[a].count;
       const countB = lateComers[b].count;
       if (countA !== countB) {
@@ -138,7 +199,7 @@ export default function LateComersTable() {
 
   const getTotalFineAmount = () => {
     return Object.values(lateComers).reduce(
-      (total, student) => total + student.fine * 50,
+      (total, student) => total + (student.uf || 0),
       0
     );
   };
@@ -150,10 +211,10 @@ export default function LateComersTable() {
         <div className="flex items-center">
           <AlertTriangle className="h-5 w-5 text-yellow-500 mr-2" />
           <div>
-            <h3 className="font-medium">Late Comers Summary</h3>
+            <h3 className="font-medium">Pending Fines Summary - {dept}</h3>
             <p className="text-sm text-gray-600">
-              Showing {filteredAndSortedLateComers.length} students with more
-              than 3 late marks
+              Showing {filteredAndSortedLateComers.length} students with unpaid
+              fines from {dept} department
             </p>
           </div>
         </div>
@@ -185,8 +246,8 @@ export default function LateComersTable() {
               <TableHead>Roll Number</TableHead>
               <TableHead>Late Count</TableHead>
               <TableHead>Department</TableHead>
-              <TableHead>Fine Amount</TableHead>
-              <TableHead>Created Date</TableHead>
+              <TableHead>Unpaid Fine</TableHead>
+              <TableHead>Last Updated</TableHead>
               <TableHead>Action</TableHead>
             </TableRow>
           </TableHeader>
@@ -196,13 +257,23 @@ export default function LateComersTable() {
                 <TableRow key={rollNumber}>
                   <TableCell className="font-medium">{rollNumber}</TableCell>
                   <TableCell>
-                    <span className="bg-red-100 text-red-800 px-1.5 sm:px-2 py-0.5 sm:py-1 text-[10px] sm:text-xs rounded-full whitespace-nowrap">
+                    <span
+                      className={`px-1.5 sm:px-2 py-0.5 sm:py-1 text-[10px] sm:text-xs rounded-full whitespace-nowrap ${
+                        lateComers[rollNumber].count > 3
+                          ? "bg-red-100 text-red-800"
+                          : "bg-yellow-100 text-yellow-800"
+                      }`}
+                    >
                       {lateComers[rollNumber].count} times
                     </span>
                   </TableCell>
-                  <TableCell>{dept}</TableCell>
-                  <TableCell>₹{lateComers[rollNumber].fine * 50}</TableCell>
-                  <TableCell>{lateComers[rollNumber].createdAt}</TableCell>
+                  <TableCell>{lateComers[rollNumber].dept}</TableCell>
+                  <TableCell>₹{lateComers[rollNumber].uf}</TableCell>
+                  <TableCell>
+                    {lateComers[rollNumber].lastUpdated
+                      ?.toDate()
+                      .toLocaleString() || "N/A"}
+                  </TableCell>
                   <TableCell>
                     <Button
                       onClick={() => handlePaymentUpdate(rollNumber)}
@@ -220,7 +291,7 @@ export default function LateComersTable() {
                   colSpan={6}
                   className="text-center text-muted-foreground py-8"
                 >
-                  No late comers found with more than 3 late marks
+                  No students with unpaid fines found in {dept} department
                 </TableCell>
               </TableRow>
             )}
