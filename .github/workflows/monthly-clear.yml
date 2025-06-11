@@ -1,0 +1,17 @@
+name: Monthly Data Clear
+
+on:
+  schedule:
+    # Runs at 00:00 on the 1st of every month
+    - cron: "0 0 1 * *"
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  clear-monthly-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger monthly clear API
+        run: |
+          curl -X POST "${{ secrets.DEPLOYMENT_URL }}/api/clear-monthly?token=${{ secrets.CRON_SECRET_TOKEN }}"
